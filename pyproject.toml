@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-codex-network-harness"
+version = "0.1.0"
+description = "Fail-fast network session wrappers for Claude Code CLI and Codex Desktop"
+requires-python = ">=3.9"
+
+[project.scripts]
+claude-network-harness = "network_harness.claude:main"
+codex-network-harness = "network_harness.codex:main"
+
+[tool.setuptools]
+packages = ["network_harness"]
