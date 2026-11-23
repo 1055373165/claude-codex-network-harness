@@ -7,7 +7,10 @@ import re
 import subprocess
 import sys
 import threading
+from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
+from typing import Optional
 from uuid import uuid4
 
 from .runtime import CONFIGURATION_FAILURE, child_exit_status, executable, terminate_child
@@ -22,8 +25,10 @@ PROVIDER_CONFIG = (
 )
 # Resume must retain the saved provider; start and fork create new threads.
 NEW_THREAD_METHODS = {"thread/start", "thread/fork"}
-TURN_METHODS = {
-    "turn/start", "turn/steer", "review/start",
+USER_TURN_METHODS = {"turn/start", "turn/addUserMessage"}
+AUTOMATIC_CONTINUATION = "reconnect"
+TURN_METHODS = USER_TURN_METHODS | {
+    "turn/steer", "review/start",
     "thread/compact/start", "thread/goal/set", "thread/prediction/request",
     "thread/queue/add", "thread/queue/start", "thread/sample",
     "thread/realtime/start", "thread/realtime/appendAudio",
@@ -41,7 +46,26 @@ NETWORK_TEXT = re.compile(
     r"stream disconnected|broken pipe|unexpected eof",
     re.IGNORECASE,
 )
-DISCONNECTED = "Session disconnected after a network failure."
+DISCONNECTED = "Network connection interrupted. Retry in this chat when your connection is back."
+
+
+@dataclass
+class DisconnectedSession:
+    turn_id: Optional[str]
+    phase: str = "closing"
+    interrupted: bool = False
+    history_requests: list = field(default_factory=list)
+    next_submission: Optional[tuple] = None
+
+
+def is_user_submission(method, params):
+    if method not in USER_TURN_METHODS or params.get("parentTurnId") or params.get("toolOutput"):
+        return False
+    trigger = params.get("turnTrigger")
+    if trigger == "resume_interrupted_task":
+        return True
+    user_input = params.get("input")
+    return trigger in (None, "edit_user_message") and isinstance(user_input, list) and bool(user_input)
 
 
 def network_error(error):
@@ -78,19 +102,40 @@ def fail_fast_session(server, app_input, app_output):
     for stream, source in ((app_input, "app"), (server.stdout, "server")):
         threading.Thread(target=relay_lines, args=(stream, source, events), daemon=True).start()
 
-    blocked_threads = set()
-    unsubscribe_sent = set()
-    control_requests = set()
+    disconnected = {}
+    control_requests = {}
 
-    def send_control(method, params):
+    def send_control(method, params, on_response=None):
         request_id = f"network-harness:{uuid4()}"
-        control_requests.add(request_id)
+        control_requests[request_id] = on_response
         write_message(server.stdin, {"id": request_id, "method": method, "params": params})
 
-    def unsubscribe(thread_id):
-        if thread_id not in unsubscribe_sent:
-            unsubscribe_sent.add(thread_id)
-            send_control("thread/unsubscribe", {"threadId": thread_id})
+    def forward_request(line):
+        server.stdin.write(line)
+        server.stdin.flush()
+
+    def finish_reconnect(thread_id, session, response):
+        request_id, new_turn = session.next_submission
+        session.next_submission = None
+        if "result" in response:
+            del disconnected[thread_id]
+            forward_request(new_turn)
+        else:
+            session.phase = "detached"
+            write_message(app_output, {"id": request_id, "error": response["error"]})
+
+    def reconnect_for_submission(thread_id, session):
+        if session.phase == "detached" and session.next_submission is not None:
+            session.phase = "reattaching"
+            send_control("thread/resume", {"threadId": thread_id, "excludeTurns": True},
+                         partial(finish_reconnect, thread_id, session))
+
+    def finish_unsubscribe(thread_id, session, _response):
+        session.phase = "detached"
+        for request in session.history_requests:
+            forward_request(request)
+        session.history_requests.clear()
+        reconnect_for_submission(thread_id, session)
 
     while True:
         source, line = events.get()
@@ -122,14 +167,26 @@ def fail_fast_session(server, app_input, app_output):
             thread_id = None
 
         if source == "app":
-            if thread_id in blocked_threads and (method == "thread/resume" or method in TURN_METHODS):
+            session = disconnected.get(thread_id)
+            if session and method == "thread/resume":
+                # Opening a chat can load its history without authorizing a new model turn.
+                if session.phase in {"closing", "detaching"}:
+                    session.history_requests.append(line)
+                else:
+                    forward_request(line)
+                continue
+            # Desktop uses this trigger for its own delayed continuation of the failed turn.
+            automatic = method in USER_TURN_METHODS and params.get("turnTrigger") == AUTOMATIC_CONTINUATION
+            if automatic or (session and method in TURN_METHODS):
+                if (session and "id" in message and is_user_submission(method, params)
+                        and session.next_submission is None):
+                    session.next_submission = (request_id, line)
+                    reconnect_for_submission(thread_id, session)
+                    continue
                 if "id" in message:
                     write_message(app_output, {
                         "id": request_id,
-                        "error": {
-                            "code": -32000,
-                            "message": f"{DISCONNECTED} Start a new chat or restart Codex to reconnect.",
-                        },
+                        "error": {"code": -32000, "message": DISCONNECTED},
                     })
                 continue
             if method in NEW_THREAD_METHODS and params.get("modelProvider") in (None, "openai"):
@@ -138,18 +195,18 @@ def fail_fast_session(server, app_input, app_output):
                 continue
         else:
             if isinstance(request_id, str) and request_id in control_requests and method is None:
-                control_requests.remove(request_id)
+                on_response = control_requests.pop(request_id)
+                if on_response:
+                    on_response(message)
                 continue
             if thread_id and method == "error" and network_error(params.get("error")):
-                first_failure = thread_id not in blocked_threads
-                blocked_threads.add(thread_id)
+                turn_id = params.get("turnId")
+                session = disconnected.setdefault(thread_id, DisconnectedSession(turn_id))
                 if params.get("willRetry"):
                     # The core's connection-loss timer is separate from the provider retry limits.
-                    if first_failure and isinstance(params.get("turnId"), str):
-                        send_control("turn/interrupt", {
-                            "threadId": thread_id,
-                            "turnId": params["turnId"],
-                        })
+                    if not session.interrupted and isinstance(turn_id, str):
+                        session.interrupted = True
+                        send_control("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
                     message["params"] = {
                         **params,
                         "willRetry": False,
@@ -159,11 +216,15 @@ def fail_fast_session(server, app_input, app_output):
                     continue
             if thread_id and method == "turn/completed":
                 turn = params.get("turn")
-                if thread_id in blocked_threads or (
-                    isinstance(turn, dict) and network_error(turn.get("error"))
-                ):
-                    blocked_threads.add(thread_id)
-                    unsubscribe(thread_id)
+                if isinstance(turn, dict):
+                    turn_id = turn.get("id")
+                    session = disconnected.get(thread_id)
+                    if session is None and network_error(turn.get("error")):
+                        session = disconnected[thread_id] = DisconnectedSession(turn_id)
+                    if session and session.phase == "closing" and session.turn_id in (None, turn_id):
+                        session.phase = "detaching"
+                        send_control("thread/unsubscribe", {"threadId": thread_id},
+                                     partial(finish_unsubscribe, thread_id, session))
 
         destination.write(line)
         destination.flush()

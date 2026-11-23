@@ -9,7 +9,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from pathlib import Path
 
 from .claude_hook import failure_kind
@@ -102,13 +102,16 @@ def read_settings(supplied):
     return settings
 
 
-def with_guard_hook(settings, channel_path, native_env):
+def session_settings(settings, native_env, failure_channel=None):
     hooks = settings.get("hooks", {})
     env = settings.get("env", {})
     if not isinstance(hooks, dict) or not isinstance(env, dict):
         raise ValueError("--settings hooks and env must be JSON objects.")
     if hooks_suppressed(env):
         raise ValueError("The supplied settings disable the required StopFailure hook.")
+    merged = {**settings, "fallbackModel": [], "env": {**env, **native_env}}
+    if failure_channel is None:
+        return merged
     stop_failure = hooks.get("StopFailure", [])
     if not isinstance(stop_failure, list):
         raise ValueError("--settings hooks.StopFailure must be an array.")
@@ -116,13 +119,11 @@ def with_guard_hook(settings, channel_path, native_env):
     # can deliver it before a non-interactive Claude invocation exits.
     command = shlex.join([
         "/bin/sh", "-c", 'IFS= read -r event; printf "%s\\n" "$event" > "$1"',
-        "network-harness", str(channel_path),
+        "network-harness", str(failure_channel),
     ])
     guard = {"matcher": "server_error|unknown", "hooks": [{"type": "command", "command": command}]}
     return {
-        **settings,
-        "fallbackModel": [],
-        "env": {**env, **native_env},
+        **merged,
         "hooks": {**hooks, "StopFailure": [guard, *stop_failure]},
     }
 
@@ -165,17 +166,25 @@ def run(binary, args, settings, native_env):
     import termios
 
     terminal_fd = sys.stdin.fileno()
+    exit_on_failure = not sys.stdout.isatty()
+    for arg in args:
+        if arg == "--":
+            break
+        if arg in ("-p", "--print"):
+            exit_on_failure = True
+            break
     terminal = None
     if os.isatty(terminal_fd):
         with suppress(OSError, termios.error):
             terminal = termios.tcgetattr(terminal_fd)
     with tempfile.TemporaryDirectory(prefix="claude-guard-", dir="/tmp") as tmp:
-        channel_path = Path(tmp) / "failure"
+        channel_path = Path(tmp) / "failure" if exit_on_failure else None
         settings_path = Path(tmp) / "settings.json"
-        os.mkfifo(channel_path, 0o600)
+        if channel_path is not None:
+            os.mkfifo(channel_path, 0o600)
         fd = os.open(settings_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as stream:
-            json.dump(with_guard_hook(settings, channel_path, native_env), stream)
+            json.dump(session_settings(settings, native_env, channel_path), stream)
         child = None
 
         def forward(signum, _):
@@ -188,20 +197,28 @@ def run(binary, args, settings, native_env):
                              (signal.SIGHUP, forward)):
             old_handlers[sig] = signal.signal(sig, handler)
         try:
-            # Keep a writer open so an idle FIFO doesn't appear permanently readable.
-            read_fd = os.open(channel_path, os.O_RDONLY | os.O_NONBLOCK)
-            with os.fdopen(read_fd, "rb"):
-                write_fd = os.open(channel_path, os.O_WRONLY | os.O_NONBLOCK)
-                with os.fdopen(write_fd, "wb"):
-                    with subprocess.Popen(
-                        [binary, "--settings", str(settings_path), *args],
-                        env={**os.environ, **native_env},
-                    ) as child:
-                        try:
-                            return supervise(child, read_fd)
-                        finally:
-                            if child.poll() is None:
-                                terminate_child(child)
+            with ExitStack() as resources:
+                reader = None
+                if channel_path is not None:
+                    # Keep a writer open so an idle FIFO doesn't appear permanently readable.
+                    reader = resources.enter_context(
+                        os.fdopen(os.open(channel_path, os.O_RDONLY | os.O_NONBLOCK), "rb")
+                    )
+                    resources.enter_context(
+                        os.fdopen(os.open(channel_path, os.O_WRONLY | os.O_NONBLOCK), "wb")
+                    )
+                with subprocess.Popen(
+                    [binary, "--settings", str(settings_path), *args],
+                    env={**os.environ, **native_env},
+                ) as child:
+                    try:
+                        if reader is None:
+                            # Claude ends the failed turn itself and keeps the composer open.
+                            return child_exit_status(child.wait())
+                        return supervise(child, reader.fileno())
+                    finally:
+                        if child.poll() is None:
+                            terminate_child(child)
         finally:
             for sig, handler in old_handlers.items():
                 signal.signal(sig, handler)
